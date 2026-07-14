@@ -475,8 +475,8 @@ Public Sub CreateSchematic()
         Const MAXRS As Long = 40
         Dim rs_room(MAXRS)   As String
         Dim rs_minHop(MAXRS) As Long
+        Dim rs_maxHop(MAXRS) As Long
         Dim rs_rank(MAXRS)   As Long
-        Dim rs_ncol(MAXRS)   As Long
         Dim nRS As Long: nRS = 0
         Dim rsMap As Object: Set rsMap = CreateObject("Scripting.Dictionary")
 
@@ -510,10 +510,11 @@ Public Sub CreateSchematic()
                 rn_hop:=rn_hop, nRN:=nRN, rnMap:=rnMap, _
                 rs_room:=rs_room, nRS:=nRS, rsMap:=rsMap)
 
-            ' Hop distance: B is one hop past A
+            ' Hop distance: B is one hop past A. Use the LONGEST path so each
+            ' device settles at its deepest column and links never run backwards.
             If rn_hop(aIdx) < 0 Then rn_hop(aIdx) = 0
             Dim h As Long: h = rn_hop(aIdx) + 1
-            If rn_hop(bIdx) < 0 Or h < rn_hop(bIdx) Then rn_hop(bIdx) = h
+            If h > rn_hop(bIdx) Then rn_hop(bIdx) = h
 
             UpdateSlot aIdx, gsl, rn_fsl, rn_lsl
             UpdateSlot bIdx, gsl, rn_fsl, rn_lsl
@@ -521,14 +522,53 @@ SkipSeg:
         Next sg
         If nRN = 0 Then GoTo NextSrc
 
-        ' Room minimum hop (for left-to-right room ordering)
-        Dim rs As Long
-        For rs = 0 To nRS - 1: rs_minHop(rs) = 999999: Next rs
+        ' Any device never reached keeps hop 0 (normally only the source)
         Dim rni As Long
         For rni = 0 To nRN - 1
-            If rn_hop(rni) < 0 Then rn_hop(rni) = 999998
+            If rn_hop(rni) < 0 Then rn_hop(rni) = 0
+        Next rni
+
+        '===================================================================
+        ' Horizontal layout: ONE COLUMN PER HOP DEPTH.
+        ' Every device the same distance from the source shares a column, so
+        ' all the ODFs in a room line up vertically and links stay horizontal.
+        ' Column 0 is the source (far left); the deepest hop sits far right.
+        '===================================================================
+        Dim maxHop As Long: maxHop = 0
+        For rni = 0 To nRN - 1
+            If rn_hop(rni) > maxHop Then maxHop = rn_hop(rni)
+        Next rni
+
+        ' Column left-edge X for each hop (colX(0) = source)
+        Dim colX(400) As Double
+        Dim fixedBoxes As Double: fixedBoxes = SRC_W + maxHop * RM_W
+        Dim gap As Double: gap = HOP_GAP
+        Dim contentW As Double: contentW = fixedBoxes + maxHop * gap
+        gPageW = MG + SRC_PX + contentW + SRC_PX + MG
+        If gPageW < MIN_PW Then
+            gPageW = MIN_PW
+            If maxHop > 0 Then gap = (gPageW - 2 * MG - 2 * SRC_PX - fixedBoxes) / maxHop
+            If gap < HOP_GAP Then gap = HOP_GAP
+        End If
+        Dim hcx As Double: hcx = MG + SRC_PX
+        Dim hh As Long
+        For hh = 0 To maxHop
+            colX(hh) = hcx
+            hcx = hcx + IIf(hh = 0, SRC_W, RM_W) + gap
+        Next hh
+
+        ' Assign each device its column X by hop depth
+        For rni = 0 To nRN - 1
+            rn_x(rni) = colX(rn_hop(rni))
+        Next rni
+
+        ' Per-room hop-column range (drives the room bands + dividers)
+        Dim rs As Long
+        For rs = 0 To nRS - 1: rs_minHop(rs) = 999999: rs_maxHop(rs) = -1: Next rs
+        For rni = 0 To nRN - 1
             Dim scn As Long: scn = rn_sec(rni)
             If rn_hop(rni) < rs_minHop(scn) Then rs_minHop(scn) = rn_hop(rni)
+            If rn_hop(rni) > rs_maxHop(scn) Then rs_maxHop(scn) = rn_hop(rni)
         Next rni
 
         ' Rank rooms left-to-right by minimum hop (source room = 0)
@@ -544,81 +584,18 @@ SkipSeg:
         Next oi
         For rs = 0 To nRS - 1: rs_rank(ord(rs)) = rs: Next rs
 
-        ' Column within each room: order devices by (hop, equip)
-        Const MAXCOL As Long = 40
-        Dim secCols() As Long: ReDim secCols(nRS, MAXCOL)
-        For rs = 0 To nRS - 1: rs_ncol(rs) = 0: Next rs
-        Dim k As Long
-        For rni = 0 To nRN - 1
-            scn = rn_sec(rni)
-            Dim pos As Long: pos = rs_ncol(scn)
-            ' insertion sort into the section's column list
-            Do While pos > 0
-                Dim pv As Long: pv = secCols(scn, pos - 1)
-                If (rn_hop(pv) < rn_hop(rni)) Or _
-                   (rn_hop(pv) = rn_hop(rni) And LCase(rn_eq(pv)) <= LCase(rn_eq(rni))) Then Exit Do
-                secCols(scn, pos) = pv
-                pos = pos - 1
-            Loop
-            secCols(scn, pos) = rni
-            rs_ncol(scn) = rs_ncol(scn) + 1
-        Next rni
-        For rs = 0 To nRS - 1
-            For k = 0 To rs_ncol(rs) - 1
-                rn_col(secCols(rs, k)) = k
-            Next k
-        Next rs
-
-        '===================================================================
-        ' Horizontal layout: equal room zones, hops pinned/spread
-        '===================================================================
-        Dim R As Long: R = nRS
-
-        ' Required width of the widest room zone
-        Dim maxNeed As Double: maxNeed = 0
-        For rs = 0 To nRS - 1
-            Dim sumBW As Double: sumBW = 0
-            For k = 0 To rs_ncol(rs) - 1
-                sumBW = sumBW + BoxW(rn_src(secCols(rs, k)))
-            Next k
-            Dim need As Double
-            need = 2 * ZONE_PAD + sumBW + (rs_ncol(rs) - 1) * HOP_GAP
-            If need > maxNeed Then maxNeed = need
-        Next rs
-
-        gPageW = 2 * MG + R * maxNeed
-        If gPageW < MIN_PW Then gPageW = MIN_PW
-        Dim zoneW As Double: zoneW = (gPageW - 2 * MG) / R
-
-        ' Assign each device its left-edge X
-        For rs = 0 To nRS - 1
-            Dim ra As Long: ra = rs_rank(rs)
-            Dim zL As Double: zL = MG + ra * zoneW
-            Dim zR As Double: zR = zL + zoneW
-            Dim nc As Long: nc = rs_ncol(rs)
-            Dim firstLeft As Double: firstLeft = zL + ZONE_PAD
-            Dim lastIdx As Long: lastIdx = secCols(rs, nc - 1)
-            Dim lastLeft As Double: lastLeft = zR - ZONE_PAD - BoxW(rn_src(lastIdx))
-            For k = 0 To nc - 1
-                Dim idx As Long: idx = secCols(rs, k)
-                Dim bw As Double: bw = BoxW(rn_src(idx))
-                Dim px As Double
-                If nc = 1 Then
-                    If rn_src(idx) Then
-                        px = MG + SRC_PX
-                    ElseIf ra = R - 1 Then
-                        px = lastLeft
-                    Else
-                        px = zL + (zoneW - bw) / 2
-                    End If
-                Else
-                    px = firstLeft + (lastLeft - firstLeft) * (k / (nc - 1))
-                    If rn_src(idx) Then px = MG + SRC_PX
-                    If ra = R - 1 And k = nc - 1 Then px = lastLeft
-                End If
-                rn_x(idx) = px
-            Next k
-        Next rs
+        ' Room band boundaries (midpoints between adjacent rooms, tiled edge-to-edge)
+        Dim bnd(MAXRS) As Double
+        bnd(0) = MG
+        bnd(nRS) = gPageW - MG
+        Dim bb As Long
+        For bb = 1 To nRS - 1
+            Dim lRoom As Long: lRoom = ord(bb - 1)
+            Dim rRoom As Long: rRoom = ord(bb)
+            Dim lEdge As Double: lEdge = colX(rs_maxHop(lRoom)) + BoxWAtHop(rs_maxHop(lRoom))
+            Dim rEdge As Double: rEdge = colX(rs_minHop(rRoom))
+            bnd(bb) = (lEdge + rEdge) / 2
+        Next bb
 
         '===================================================================
         ' Vertical layout & page
@@ -653,13 +630,13 @@ SkipSeg:
         Dim bandT As Double: bandT = gPageH - HDRI - HDR_H - SITE_H
         Dim bandB As Double: bandB = bandT - ROOM_H
 
-        ' 1. Room zones: swim-lane background + header band
+        ' 1. Room zones: swim-lane background + header band (tiled edge-to-edge)
         For rs = 0 To nRS - 1
-            ra = rs_rank(rs)
-            zL = MG + ra * zoneW
-            zR = zL + zoneW
+            Dim ra As Long: ra = rs_rank(rs)
+            Dim zL As Double: zL = bnd(ra)
+            Dim zR As Double: zR = bnd(ra + 1)
 
-            ' vertical extent of this zone's devices
+            ' vertical extent of this room's devices
             Dim fsInSec As Long: fsInSec = 999999
             Dim lsInSec As Long: lsInSec = 0
             For rni = 0 To nRN - 1
@@ -691,12 +668,12 @@ SkipSeg:
 NextZone:
         Next rs
 
-        ' 2. Room divider lines between zones
+        ' 2. Room divider lines at the band boundaries
         Dim contTop As Double: contTop = lTop + SRC_RKH + SRC_PY
         Dim contBot As Double: contBot = lTop - nSlots * PORT_H - DEV_H - SRC_PY
         Dim dv As Long
-        For dv = 1 To R - 1
-            Dim dvX As Double: dvX = MG + dv * zoneW
+        For dv = 1 To nRS - 1
+            Dim dvX As Double: dvX = bnd(dv)
             Dim dvSh0 As Object: Set dvSh0 = gPage.DrawLine(dvX, contBot, dvX, contTop)
             dvSh0.Cells("LineColor").Formula = C_DIV
             dvSh0.Cells("LinePattern").Formula = "2"
@@ -825,6 +802,11 @@ End Sub
 
 Private Function BoxW(isSrc As Boolean) As Double
     BoxW = IIf(isSrc, SRC_W, RM_W)
+End Function
+
+' Box width for the device that sits at a given hop column (hop 0 = source).
+Private Function BoxWAtHop(hop As Long) As Double
+    BoxWAtHop = IIf(hop = 0, SRC_W, RM_W)
 End Function
 
 '===========================================================================

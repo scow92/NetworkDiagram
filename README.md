@@ -39,30 +39,39 @@ all site text is read from the `Front Sheet` at run time.
 4. `TestColumns` is a diagnostic that dumps the parsed columns of the first
    circuit row, useful if your schedule's column positions differ.
 
-## v15 layout notes
+## v16 layout notes
 
-- **Hop-ordered placement.** Each device is one box, positioned left-to-right by
-  its "hop distance" from the source. The A-end (source) is pinned to the far
-  left; the terminal B-end is pinned to the far right.
-- **Equal room zones.** Rooms divide the page into equal-width zones, dynamically:
-  one room ⇒ hops are spread wide and centred; N rooms ⇒ the page is split into
-  N zones with a dashed divider between them. Page width grows with the number of
-  rooms and the number of hops per room.
-- **Clean links.** Every hop of a chain shares the same row Y, so links are
-  straight horizontal lines joining device edges. (`DrawCktLine` still falls back
-  to an orthogonal L-shape if two ends ever differ in height.)
-- Every circuit segment is drawn, including multi-room continuation (CAL-chain)
-  and NIS implied-tie links.
+- **One column per hop depth.** Every device the same "hop distance" from the
+  source shares a single vertical column. So all the ODFs a source reaches in a
+  room line up in one column instead of each getting its own — which is what
+  previously fanned the links out into diagonals.
+- **Endpoints pinned.** The source (A-end) is column 0, pinned to the far left;
+  the deepest hop (terminal B-end) is pinned to the far right.
+- **Dynamic spacing.** Column spacing fills the page width: one hop-column ⇒ wide,
+  centred spacing; more hops ⇒ tighter, evenly spaced. Page width grows with the
+  number of hop columns.
+- **Rooms as tiled zones.** Each room is a background band spanning the hop
+  columns of its devices, tiled edge-to-edge with a dashed divider at each
+  boundary (Room 1 | Room 2 | …).
+- **Clean links.** Because every hop of a chain shares its row Y and columns
+  increase left-to-right, links are straight horizontal lines. (`DrawCktLine`
+  still falls back to an orthogonal L-shape if two ends ever differ in height.)
 
 Example — a two-room circuit renders like:
 
 ```
-            Room 1                    |            Room 2
-core-router-1 >> ODF1 T1 P1 >>>>>>>>>>|>> ODF2 T1 P1 >>>>> core-router-2
+                Room 1              |            Room 2
+core-router-1 >> ODF1 T1 P1 >>>>>>>>|>> ODF2 T1 P1 >>>>> core-router-2
+core-router-1 >> ODF1 T1 P1 >>>>>>>>|>>>>>>>>>>>>>>>>>>> core-router-2
 ```
+
+Both rows share the same ODF1 column and the same core-router-2 column, so the
+devices stay aligned and the links stay horizontal.
 
 ### Known limitation
 
-Within a single room, a device that is both a pass-through's incoming and
-outgoing end is shown as one box; if a room contains many hops the zone widens
-to fit them. Very dense single-room chains can therefore make a page quite wide.
+A device reached at different hop depths on different circuits is drawn once, at
+its deepest column; a link into it on a shorter path is still horizontal but
+spans the intermediate (empty) columns. Rooms whose hop ranges interleave can
+produce overlapping bands — normal linear circuits (room 1 then room 2) tile
+cleanly.
