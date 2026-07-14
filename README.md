@@ -39,15 +39,30 @@ all site text is read from the `Front Sheet` at run time.
 4. `TestColumns` is a diagnostic that dumps the parsed columns of the first
    circuit row, useful if your schedule's column positions differ.
 
-## v14 layout notes
+## v15 layout notes
 
+- **Hop-ordered placement.** Each device is one box, positioned left-to-right by
+  its "hop distance" from the source. The A-end (source) is pinned to the far
+  left; the terminal B-end is pinned to the far right.
+- **Equal room zones.** Rooms divide the page into equal-width zones, dynamically:
+  one room ⇒ hops are spread wide and centred; N rooms ⇒ the page is split into
+  N zones with a dashed divider between them. Page width grows with the number of
+  rooms and the number of hops per room.
+- **Clean links.** Every hop of a chain shares the same row Y, so links are
+  straight horizontal lines joining device edges. (`DrawCktLine` still falls back
+  to an orthogonal L-shape if two ends ever differ in height.)
 - Every circuit segment is drawn, including multi-room continuation (CAL-chain)
-  and NIS implied-tie links that route right-to-left. Earlier versions only
-  drew a link when the destination sat strictly to the right of its source end,
-  which left cross-room circuits unconnected.
-- Links are joined at the exact port-row anchor on both device edges. When the
-  two ends differ in height the link is routed orthogonally (L-shaped) instead
-  of as a diagonal.
-- Page width grows with the number of room sections in the circuit
-  (`same-room group + MID_GAP + other-room group`), so wide, multi-ODF circuits
-  get a wider page automatically.
+  and NIS implied-tie links.
+
+Example — a two-room circuit renders like:
+
+```
+            Room 1                    |            Room 2
+core-router-1 >> ODF1 T1 P1 >>>>>>>>>>|>> ODF2 T1 P1 >>>>> core-router-2
+```
+
+### Known limitation
+
+Within a single room, a device that is both a pass-through's incoming and
+outgoing end is shown as one box; if a room contains many hops the zone widens
+to fit them. Very dense single-room chains can therefore make a page quite wide.

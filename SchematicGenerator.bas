@@ -1,23 +1,24 @@
 Option Explicit
 '===========================================================================
-' SchematicGenerator  v14
-' Room-section layout | CAL chain tracing | DeviceNames classification
+' SchematicGenerator  v15
+' Hop-ordered room layout | CAL chain tracing | DeviceNames classification
 '
 ' clsCircuit: Cable, CableType, FromKey, ToKey, FromPort, ToPort,
 '             Cal, Length, ConnectorA, TxA, ConnectorB, TxB
 ' clsNode:    Key, Room, Rack, Equip, IsPassive
 ' DeviceNames sheet col A = generic device name stems
 '
-' v14 changes:
-'   * Connection lines now draw for EVERY segment (previous "toX > fromX"
-'     guard silently dropped continuation / NIS links that routed right-to-
-'     left, leaving multi-room circuits unconnected).
-'   * DrawCktLine routes orthogonally (L-shaped) when the two endpoints are
-'     not at the same height, so a link always joins the two device edges
-'     instead of leaving a stray diagonal.
-'   * Page width grows with the number of room sections in a circuit.
+' v15 layout model:
+'   * One page per source device; each circuit / CAL chain is one horizontal
+'     row (slot). Devices shared across circuits are drawn once as a tall box.
+'   * Each device is placed left-to-right by its "hop distance" from the source.
+'     The A-end (source) is pinned to the far left; the terminal B-end is pinned
+'     to the far right.
+'   * Rooms divide the page into EQUAL-WIDTH zones (dynamic: 1 room -> hops
+'     spread wide and centred; N rooms -> page split into N zones with dividers).
+'   * Because every hop of a chain shares the same row Y, links are clean
+'     straight horizontal lines that join the device edges.
 '===========================================================================
-Private Const MID_GAP As Double = 4   ' routing zone between same-room and other-room sections
 
 '-- SHEET NAMES ------------------------------------------------------------
 Private Const SHT_FIBR As String = "Cable Schedule - Fibres"
@@ -51,6 +52,7 @@ Private Const HDRI    As Double = 0.12   ' page top inset
 Private Const HDR_H   As Double = 0.78   ' header strip
 Private Const SITE_H  As Double = 0.42   ' site banner
 Private Const ROOM_H  As Double = 0.38   ' room name strip
+Private Const MIN_PW  As Double = 16#    ' A3 landscape minimum page width
 
 '-- SOURCE DEVICE ----------------------------------------------------------
 Private Const SRC_W   As Double = 2.7
@@ -63,9 +65,10 @@ Private Const RM_W    As Double = 2.7
 Private Const RM_PX   As Double = 0.12
 Private Const RM_PY   As Double = 0.08
 Private Const RM_RKH  As Double = 0.22
-Private Const INNER_G As Double = 0.25   ' gap between L and R sub-cols
-Private Const SECT_G  As Double = 0.5    ' gap between sections
-Private Const ROUTE_W As Double = 0.8    ' min routing zone
+
+'-- HORIZONTAL SPACING -----------------------------------------------------
+Private Const HOP_GAP  As Double = 1#    ' target gap between hops within a room
+Private Const ZONE_PAD As Double = 0.4   ' inset from a room zone's edges
 
 '-- PORT GEOMETRY ----------------------------------------------------------
 Private Const DEV_H   As Double = 0.3
@@ -88,9 +91,9 @@ Private Const C_BRK As String = "THEMEGUARD(RGB(135,158,185))"
 Private Const C_SD  As String = "THEMEGUARD(RGB(170,185,205))"
 Private Const C_SR  As String = "THEMEGUARD(RGB(90,120,160))"
 Private Const C_SRM As String = "THEMEGUARD(RGB(55,85,130))"
-Private Const C_SCH As String = "THEMEGUARD(RGB(170,192,218))"
 Private Const C_SCB As String = "THEMEGUARD(RGB(105,138,175))"
 Private Const C_SCS As String = "THEMEGUARD(RGB(240,244,250))"
+Private Const C_DIV As String = "THEMEGUARD(RGB(150,165,185))"   ' room divider line
 
 '-- CABLE LINE STYLES ------------------------------------------------------
 Private Const F_COL As String = "THEMEGUARD(RGB(0,80,200))"
@@ -449,210 +452,182 @@ Public Sub CreateSchematic()
             End If
         Next di
 
-        ' -- Build room section & room node data ---------------------------
-        '
-        ' Room nodes (rn): unique (deviceKey, sub-col) entries.
-        ' Sub-col placement:
-        '   NIS End-B  -> LEFT only  (entry into room via implied tie)
-        '   non-NIS End-A (not srcKey) -> LEFT (continuation circuit origin)
-        '   non-NIS End-B -> RIGHT
-        '
-        Const MAXRS As Long = 20
-        Dim rs_room(MAXRS) As String
-        Dim rs_hasL(MAXRS) As Boolean   ' section needs a LEFT sub-col
-        Dim rs_leftX(MAXRS) As Double   ' device box left X in LEFT sub-col
-        Dim rs_rightX(MAXRS) As Double  ' device box left X in RIGHT sub-col
-        Dim rs_swimL(MAXRS) As Double
-        Dim rs_swimR(MAXRS) As Double
-        Dim nRS As Long: nRS = 0
-        Dim rsMap As Object: Set rsMap = CreateObject("Scripting.Dictionary")
-
-        Const MAXRN As Long = 200
+        '===================================================================
+        ' Build the hop-ordered node model
+        '   rn_*  : one entry per distinct device (node key)
+        '   rs_*  : one entry per distinct room
+        '===================================================================
+        Const MAXRN As Long = 300
         Dim rn_key(MAXRN)  As String
-        Dim rn_room(MAXRN) As String
         Dim rn_rack(MAXRN) As String
         Dim rn_eq(MAXRN)   As String
         Dim rn_pass(MAXRN) As Boolean
-        Dim rn_isL(MAXRN)  As Boolean   ' True = LEFT sub-col
-        Dim rn_sec(MAXRN)  As Long
-        Dim rn_fsl(MAXRN)  As Long      ' first global slot
-        Dim rn_lsl(MAXRN)  As Long      ' last global slot
-        Dim rn_pc(MAXRN)   As Long      ' real port count
+        Dim rn_src(MAXRN)  As Boolean
+        Dim rn_sec(MAXRN)  As Long      ' room section index
+        Dim rn_fsl(MAXRN)  As Long      ' first slot
+        Dim rn_lsl(MAXRN)  As Long      ' last slot
+        Dim rn_hop(MAXRN)  As Long      ' hop distance from source (-1 = unset)
+        Dim rn_col(MAXRN)  As Long      ' column within its room
+        Dim rn_x(MAXRN)    As Double    ' left edge X of device box
         Dim nRN As Long: nRN = 0
         Dim rnMap As Object: Set rnMap = CreateObject("Scripting.Dictionary")
 
+        Const MAXRS As Long = 40
+        Dim rs_room(MAXRS)   As String
+        Dim rs_minHop(MAXRS) As Long
+        Dim rs_rank(MAXRS)   As Long
+        Dim rs_ncol(MAXRS)   As Long
+        Dim nRS As Long: nRS = 0
+        Dim rsMap As Object: Set rsMap = CreateObject("Scripting.Dictionary")
+
+        ' Pre-create the source node as hop 0
+        Dim srcIdx As Long
+        srcIdx = EnsureRoomNode(srcKey, srcNd, True, nodesInit:=True, _
+            rn_key:=rn_key, rn_rack:=rn_rack, rn_eq:=rn_eq, rn_pass:=rn_pass, _
+            rn_src:=rn_src, rn_sec:=rn_sec, rn_fsl:=rn_fsl, rn_lsl:=rn_lsl, _
+            rn_hop:=rn_hop, nRN:=nRN, rnMap:=rnMap, _
+            rs_room:=rs_room, nRS:=nRS, rsMap:=rsMap)
+        rn_hop(srcIdx) = 0
+
         Dim sg As Long
         For sg = 0 To nSeg - 1
-            Dim sTyp As String: sTyp = s_ty(sg)
-            Dim aK   As String: aK = s_aK(sg)
-            Dim bK   As String: bK = s_bK(sg)
-            Dim gsl  As Long:   gsl = s_sl(sg)
+            Dim aK As String: aK = s_aK(sg)
+            Dim bK As String: bK = s_bK(sg)
+            Dim gsl As Long:  gsl = s_sl(sg)
             If bK = "" Then GoTo SkipSeg
 
+            Dim aIdx As Long, bIdx As Long
+            Dim aNode As clsNode: Set aNode = allNodes(aK)
             Dim bNode As clsNode: Set bNode = allNodes(bK)
+            aIdx = EnsureRoomNode(aK, aNode, (aK = srcKey), nodesInit:=False, _
+                rn_key:=rn_key, rn_rack:=rn_rack, rn_eq:=rn_eq, rn_pass:=rn_pass, _
+                rn_src:=rn_src, rn_sec:=rn_sec, rn_fsl:=rn_fsl, rn_lsl:=rn_lsl, _
+                rn_hop:=rn_hop, nRN:=nRN, rnMap:=rnMap, _
+                rs_room:=rs_room, nRS:=nRS, rsMap:=rsMap)
+            bIdx = EnsureRoomNode(bK, bNode, False, nodesInit:=False, _
+                rn_key:=rn_key, rn_rack:=rn_rack, rn_eq:=rn_eq, rn_pass:=rn_pass, _
+                rn_src:=rn_src, rn_sec:=rn_sec, rn_fsl:=rn_fsl, rn_lsl:=rn_lsl, _
+                rn_hop:=rn_hop, nRN:=nRN, rnMap:=rnMap, _
+                rs_room:=rs_room, nRS:=nRS, rsMap:=rsMap)
 
-            ' Ensure room section exists for bNode's room
-            Dim rmKey As String: rmKey = LCase(bNode.Room)
-            If Not rsMap.Exists(rmKey) Then
-                rsMap.Add rmKey, nRS
-                rs_room(nRS) = bNode.Room: nRS = nRS + 1
-            End If
-            Dim secIdxB As Long: secIdxB = CLng(rsMap(rmKey))
+            ' Hop distance: B is one hop past A
+            If rn_hop(aIdx) < 0 Then rn_hop(aIdx) = 0
+            Dim h As Long: h = rn_hop(aIdx) + 1
+            If rn_hop(bIdx) < 0 Or h < rn_hop(bIdx) Then rn_hop(bIdx) = h
 
-            If sTyp = "NIS" Then
-                ' NIS End-B -> LEFT sub-col only (no port)
-                Dim rnKL As String: rnKL = bK & "|L"
-                If Not rnMap.Exists(rnKL) Then
-                    rnMap.Add rnKL, nRN
-                    rn_key(nRN) = bK: rn_room(nRN) = bNode.Room
-                    rn_rack(nRN) = bNode.Rack: rn_eq(nRN) = bNode.Equip
-                    rn_pass(nRN) = bNode.IsPassive: rn_isL(nRN) = True
-                    rn_sec(nRN) = secIdxB
-                    rn_fsl(nRN) = gsl: rn_lsl(nRN) = gsl: rn_pc(nRN) = 0
-                    rs_hasL(secIdxB) = True: nRN = nRN + 1
-                Else
-                    Dim rnI0 As Long: rnI0 = CLng(rnMap(rnKL))
-                    If gsl < rn_fsl(rnI0) Then rn_fsl(rnI0) = gsl
-                    If gsl > rn_lsl(rnI0) Then rn_lsl(rnI0) = gsl
-                End If
-                GoTo SkipSeg   ' NIS has no End-B port or End-A port to add elsewhere
-            End If
-
-            ' Non-NIS: End-B -> RIGHT sub-col
-            Dim rnKR As String: rnKR = bK & "|R"
-            If Not rnMap.Exists(rnKR) Then
-                rnMap.Add rnKR, nRN
-                rn_key(nRN) = bK: rn_room(nRN) = bNode.Room
-                rn_rack(nRN) = bNode.Rack: rn_eq(nRN) = bNode.Equip
-                rn_pass(nRN) = bNode.IsPassive: rn_isL(nRN) = False
-                rn_sec(nRN) = secIdxB
-                rn_fsl(nRN) = gsl: rn_lsl(nRN) = gsl: rn_pc(nRN) = 1
-                nRN = nRN + 1
-            Else
-                Dim rnI1 As Long: rnI1 = CLng(rnMap(rnKR))
-                If gsl < rn_fsl(rnI1) Then rn_fsl(rnI1) = gsl
-                If gsl > rn_lsl(rnI1) Then rn_lsl(rnI1) = gsl
-                rn_pc(rnI1) = rn_pc(rnI1) + 1
-            End If
-
-            ' Non-NIS with End-A not srcKey -> End-A also in LEFT sub-col
-            If aK <> srcKey And allNodes.Exists(aK) Then
-                Dim aNode As clsNode: Set aNode = allNodes(aK)
-                Dim rmKeyA As String: rmKeyA = LCase(aNode.Room)
-                If Not rsMap.Exists(rmKeyA) Then
-                    rsMap.Add rmKeyA, nRS
-                    rs_room(nRS) = aNode.Room: nRS = nRS + 1
-                End If
-                Dim secIdxA As Long: secIdxA = CLng(rsMap(rmKeyA))
-                Dim rnKLA As String: rnKLA = aK & "|L"
-                If Not rnMap.Exists(rnKLA) Then
-                    rnMap.Add rnKLA, nRN
-                    rn_key(nRN) = aK: rn_room(nRN) = aNode.Room
-                    rn_rack(nRN) = aNode.Rack: rn_eq(nRN) = aNode.Equip
-                    rn_pass(nRN) = aNode.IsPassive: rn_isL(nRN) = True
-                    rn_sec(nRN) = secIdxA
-                    rn_fsl(nRN) = gsl: rn_lsl(nRN) = gsl: rn_pc(nRN) = 1
-                    rs_hasL(secIdxA) = True: nRN = nRN + 1
-                Else
-                    Dim rni2 As Long: rni2 = CLng(rnMap(rnKLA))
-                    If gsl < rn_fsl(rni2) Then rn_fsl(rni2) = gsl
-                    If gsl > rn_lsl(rni2) Then rn_lsl(rni2) = gsl
-                    rn_pc(rni2) = rn_pc(rni2) + 1
-                End If
-            End If
+            UpdateSlot aIdx, gsl, rn_fsl, rn_lsl
+            UpdateSlot bIdx, gsl, rn_fsl, rn_lsl
 SkipSeg:
         Next sg
-        ' Guarantee source room is the leftmost destination section
-        Dim srcRmKey As String: srcRmKey = LCase(srcNd.Room)
-        If rsMap.Exists(srcRmKey) Then
-            Dim srcRsI As Long: srcRsI = CLng(rsMap(srcRmKey))
-            If srcRsI <> 0 Then
-                Dim swpRoom As String:  swpRoom = rs_room(0)
-                Dim swpHasL As Boolean: swpHasL = rs_hasL(0)
-                rs_room(0) = rs_room(srcRsI): rs_hasL(0) = rs_hasL(srcRsI)
-                rs_room(srcRsI) = swpRoom:   rs_hasL(srcRsI) = swpHasL
-                rsMap(srcRmKey) = 0
-                rsMap(LCase(swpRoom)) = srcRsI
-                Dim rniS As Long
-                For rniS = 0 To nRN - 1
-                    If rn_sec(rniS) = srcRsI Then
-                        rn_sec(rniS) = 0
-                    ElseIf rn_sec(rniS) = 0 Then
-                        rn_sec(rniS) = srcRsI
-                    End If
-                Next rniS
-            End If
-        End If
-        If nRS = 0 Then GoTo NextSrc
+        If nRN = 0 Then GoTo NextSrc
 
-        ' -- Section widths ------------------------------------------------
-        Dim totSecW As Double: totSecW = 0
-        Dim secW(MAXRS) As Double
+        ' Room minimum hop (for left-to-right room ordering)
         Dim rs As Long
+        For rs = 0 To nRS - 1: rs_minHop(rs) = 999999: Next rs
+        Dim rni As Long
+        For rni = 0 To nRN - 1
+            If rn_hop(rni) < 0 Then rn_hop(rni) = 999998
+            Dim scn As Long: scn = rn_sec(rni)
+            If rn_hop(rni) < rs_minHop(scn) Then rs_minHop(scn) = rn_hop(rni)
+        Next rni
+
+        ' Rank rooms left-to-right by minimum hop (source room = 0)
+        Dim ord(MAXRS) As Long
+        For rs = 0 To nRS - 1: ord(rs) = rs: Next rs
+        Dim oi As Long, oj As Long
+        For oi = 0 To nRS - 2
+            For oj = 0 To nRS - 2 - oi
+                If rs_minHop(ord(oj)) > rs_minHop(ord(oj + 1)) Then
+                    Dim ot As Long: ot = ord(oj): ord(oj) = ord(oj + 1): ord(oj + 1) = ot
+                End If
+            Next oj
+        Next oi
+        For rs = 0 To nRS - 1: rs_rank(ord(rs)) = rs: Next rs
+
+        ' Column within each room: order devices by (hop, equip)
+        Const MAXCOL As Long = 40
+        Dim secCols() As Long: ReDim secCols(nRS, MAXCOL)
+        For rs = 0 To nRS - 1: rs_ncol(rs) = 0: Next rs
+        Dim k As Long
+        For rni = 0 To nRN - 1
+            scn = rn_sec(rni)
+            Dim pos As Long: pos = rs_ncol(scn)
+            ' insertion sort into the section's column list
+            Do While pos > 0
+                Dim pv As Long: pv = secCols(scn, pos - 1)
+                If (rn_hop(pv) < rn_hop(rni)) Or _
+                   (rn_hop(pv) = rn_hop(rni) And LCase(rn_eq(pv)) <= LCase(rn_eq(rni))) Then Exit Do
+                secCols(scn, pos) = pv
+                pos = pos - 1
+            Loop
+            secCols(scn, pos) = rni
+            rs_ncol(scn) = rs_ncol(scn) + 1
+        Next rni
         For rs = 0 To nRS - 1
-            If rs_hasL(rs) Then
-                secW(rs) = 2 * RM_PX + 2 * RM_W + INNER_G
-            Else
-                secW(rs) = 2 * RM_PX + RM_W
-            End If
-            totSecW = totSecW + secW(rs)
+            For k = 0 To rs_ncol(rs) - 1
+                rn_col(secCols(rs, k)) = k
+            Next k
         Next rs
 
-        ' -- Split sections: same room as source (left group) vs others ----
-        Dim srcRmLow As String: srcRmLow = LCase(srcNd.Room)
-        Dim sameW As Double: sameW = 0:  Dim nSame As Long: nSame = 0
-        Dim othW  As Double: othW = 0:   Dim nOth  As Long: nOth = 0
+        '===================================================================
+        ' Horizontal layout: equal room zones, hops pinned/spread
+        '===================================================================
+        Dim R As Long: R = nRS
+
+        ' Required width of the widest room zone
+        Dim maxNeed As Double: maxNeed = 0
         For rs = 0 To nRS - 1
-            If LCase(rs_room(rs)) = srcRmLow Then
-                If nSame > 0 Then sameW = sameW + SECT_G
-                sameW = sameW + secW(rs): nSame = nSame + 1
-            Else
-                If nOth > 0 Then othW = othW + SECT_G
-                othW = othW + secW(rs): nOth = nOth + 1
-            End If
+            Dim sumBW As Double: sumBW = 0
+            For k = 0 To rs_ncol(rs) - 1
+                sumBW = sumBW + BoxW(rn_src(secCols(rs, k)))
+            Next k
+            Dim need As Double
+            need = 2 * ZONE_PAD + sumBW + (rs_ncol(rs) - 1) * HOP_GAP
+            If need > maxNeed Then maxNeed = need
         Next rs
 
-        ' -- Page width: grows with the number of room sections ------------
-        Dim srcColW As Double: srcColW = 2 * SRC_PX + SRC_W
-        Dim minPW As Double
-        minPW = MG + srcColW + ROUTE_W + sameW + MID_GAP + othW + MG
-        If minPW < 16# Then minPW = 16#   ' A3 landscape minimum
-        gPageW = minPW
+        gPageW = 2 * MG + R * maxNeed
+        If gPageW < MIN_PW Then gPageW = MIN_PW
+        Dim zoneW As Double: zoneW = (gPageW - 2 * MG) / R
 
-        ' -- Section X positions: same-room packed left, others packed right
-        Dim curL As Double: curL = MG + srcColW + ROUTE_W
-        Dim curR As Double: curR = gPageW - MG
-        Dim rs2 As Long
-        For rs2 = 0 To nRS - 1
-            If LCase(rs_room(rs2)) = srcRmLow Then
-                rs_swimL(rs2) = curL
-                rs_swimR(rs2) = curL + secW(rs2)
-                curL = rs_swimR(rs2) + SECT_G
-            Else
-                rs_swimR(rs2) = curR
-                rs_swimL(rs2) = curR - secW(rs2)
-                curR = rs_swimL(rs2) - SECT_G
-            End If
-            If rs_hasL(rs2) Then
-                rs_leftX(rs2) = rs_swimL(rs2) + RM_PX
-                rs_rightX(rs2) = rs_swimL(rs2) + RM_PX + RM_W + INNER_G
-            Else
-                rs_rightX(rs2) = rs_swimL(rs2) + RM_PX
-                rs_leftX(rs2) = rs_rightX(rs2)
-            End If
-        Next rs2
+        ' Assign each device its left-edge X
+        For rs = 0 To nRS - 1
+            Dim ra As Long: ra = rs_rank(rs)
+            Dim zL As Double: zL = MG + ra * zoneW
+            Dim zR As Double: zR = zL + zoneW
+            Dim nc As Long: nc = rs_ncol(rs)
+            Dim firstLeft As Double: firstLeft = zL + ZONE_PAD
+            Dim lastIdx As Long: lastIdx = secCols(rs, nc - 1)
+            Dim lastLeft As Double: lastLeft = zR - ZONE_PAD - BoxW(rn_src(lastIdx))
+            For k = 0 To nc - 1
+                Dim idx As Long: idx = secCols(rs, k)
+                Dim bw As Double: bw = BoxW(rn_src(idx))
+                Dim px As Double
+                If nc = 1 Then
+                    If rn_src(idx) Then
+                        px = MG + SRC_PX
+                    ElseIf ra = R - 1 Then
+                        px = lastLeft
+                    Else
+                        px = zL + (zoneW - bw) / 2
+                    End If
+                Else
+                    px = firstLeft + (lastLeft - firstLeft) * (k / (nc - 1))
+                    If rn_src(idx) Then px = MG + SRC_PX
+                    If ra = R - 1 And k = nc - 1 Then px = lastLeft
+                End If
+                rn_x(idx) = px
+            Next k
+        Next rs
 
-        ' Source device X and height
-        Dim lX  As Double: lX = MG + SRC_PX
+        '===================================================================
+        ' Vertical layout & page
+        '===================================================================
         Dim lH  As Double: lH = DEV_H + nSlots * PORT_H
         Dim lRkH As Double: lRkH = SRC_PY + SRC_RKH + lH + SRC_PY
-
-        ' Page height
         Dim pH As Double: pH = HDRI + HDR_H + SITE_H + ROOM_H + MG + lRkH + MG
         If pH < 11 Then pH = 11
         gPageH = pH
-
-        ' lTop = Y of top of source device box
         Dim lTop As Double
         lTop = gPageH - HDRI - HDR_H - SITE_H - ROOM_H - MG - SRC_PY - SRC_RKH
 
@@ -672,268 +647,127 @@ SkipSeg:
         gPage.PageSheet.Cells("PageHeight").Formula = gPageH & " in"
         pageN = pageN + 1
 
-        ' -- DRAW ----------------------------------------------------------
+        '===================================================================
+        ' DRAW
+        '===================================================================
+        Dim bandT As Double: bandT = gPageH - HDRI - HDR_H - SITE_H
+        Dim bandB As Double: bandB = bandT - ROOM_H
 
-        ' 1. Swim lanes per room section
+        ' 1. Room zones: swim-lane background + header band
         For rs = 0 To nRS - 1
-            ' Find first and last global slot in this section
+            ra = rs_rank(rs)
+            zL = MG + ra * zoneW
+            zR = zL + zoneW
+
+            ' vertical extent of this zone's devices
             Dim fsInSec As Long: fsInSec = 999999
             Dim lsInSec As Long: lsInSec = 0
-            Dim rni As Long
             For rni = 0 To nRN - 1
                 If rn_sec(rni) = rs Then
                     If rn_fsl(rni) < fsInSec Then fsInSec = rn_fsl(rni)
                     If rn_lsl(rni) > lsInSec Then lsInSec = rn_lsl(rni)
                 End If
             Next rni
-            If fsInSec = 999999 Then GoTo NextRS
+            If fsInSec = 999999 Then GoTo NextZone
             Dim swT As Double: swT = lTop - fsInSec * PORT_H + RM_PY + RM_RKH
             Dim swB As Double: swB = lTop - (lsInSec + 1) * PORT_H - DEV_H - RM_PY
 
-            ' Swim lane background
             Dim swSh As Object
-            Set swSh = gPage.DrawRectangle(rs_swimL(rs), swB, rs_swimR(rs), swT)
+            Set swSh = gPage.DrawRectangle(zL, swB, zR, swT)
             swSh.Cells("FillForegnd").Formula = C_SCS
             swSh.Cells("FillBkgnd").Formula = C_SCS
             swSh.Cells("FillPattern").Formula = "1"
             swSh.Cells("LineColor").Formula = C_SCB
             swSh.Cells("LineWeight").Formula = "0.75pt"
 
-            ' Room name banner in the ROOM_H strip
-            Dim bnT As Double: bnT = gPageH - HDRI - HDR_H - SITE_H
-            Dim bnB As Double: bnB = bnT - ROOM_H
             Dim bnSh As Object
-            Set bnSh = MkBox(rs_swimL(rs), bnB, rs_swimR(rs), bnT, 222, 230, 240)
+            Set bnSh = MkBox(zL, bandB, zR, bandT, 222, 230, 240)
             bnSh.Cells("LineWeight").Formula = "1pt"
             bnSh.text = StrConv(rs_room(rs), vbProperCase)
             bnSh.Cells("Char.Size").Formula = "10pt"
             bnSh.Cells("Char.Style").Formula = "1"
             bnSh.Cells("VerticalAlign").Formula = "1"
             bnSh.Cells("Para.HorzAlign").Formula = "1"
-NextRS:
+NextZone:
         Next rs
 
-        ' 2. Room section rack boxes and device boxes
-        For rni2 = 0 To nRN - 1
-            If rn_pc(rni2) = 0 Then GoTo SkipRN   ' no real ports
-            Dim devX As Double
-            If rn_isL(rni2) Then
-                devX = rs_leftX(rn_sec(rni2))
-            Else
-                devX = rs_rightX(rn_sec(rni2))
-            End If
-            Dim devTopY As Double: devTopY = lTop - rn_fsl(rni2) * PORT_H
-            Dim devHt As Double
-            devHt = DEV_H + (rn_lsl(rni2) - rn_fsl(rni2) + 1) * PORT_H
+        ' 2. Room divider lines between zones
+        Dim contTop As Double: contTop = lTop + SRC_RKH + SRC_PY
+        Dim contBot As Double: contBot = lTop - nSlots * PORT_H - DEV_H - SRC_PY
+        Dim dv As Long
+        For dv = 1 To R - 1
+            Dim dvX As Double: dvX = MG + dv * zoneW
+            Dim dvSh0 As Object: Set dvSh0 = gPage.DrawLine(dvX, contBot, dvX, contTop)
+            dvSh0.Cells("LineColor").Formula = C_DIV
+            dvSh0.Cells("LinePattern").Formula = "2"
+            dvSh0.Cells("LineWeight").Formula = "1pt"
+            dvSh0.Cells("BeginArrow").Formula = "0"
+            dvSh0.Cells("EndArrow").Formula = "0"
+        Next dv
 
-            ' Rack box (wraps device box)
-            Dim rkX1 As Double: rkX1 = devX - RM_PX
-            Dim rkX2 As Double: rkX2 = devX + RM_W + RM_PX
-            Dim rkY1 As Double: rkY1 = devTopY - devHt - RM_PY
-            Dim rkY2 As Double: rkY2 = devTopY + RM_RKH + RM_PY
-            Dim rkSh As Object
-            Set rkSh = gPage.DrawRectangle(rkX1, rkY1, rkX2, rkY2)
-            rkSh.Cells("FillForegnd").Formula = C_RKB
-            rkSh.Cells("FillBkgnd").Formula = C_RKB
-            rkSh.Cells("FillPattern").Formula = "1"
-            rkSh.Cells("LineColor").Formula = C_BRK
-            rkSh.Cells("LineWeight").Formula = "0.75pt"
-            Dim rkHSh As Object
-            Set rkHSh = gPage.DrawRectangle(rkX1, rkY2 - RM_RKH, rkX2, rkY2)
-            rkHSh.Cells("FillForegnd").Formula = C_RKH
-            rkHSh.Cells("FillBkgnd").Formula = C_RKH
-            rkHSh.Cells("FillPattern").Formula = "1"
-            rkHSh.Cells("LineColor").Formula = C_BRK
-            rkHSh.Cells("LineWeight").Formula = "0.5pt"
-            rkHSh.text = rn_rack(rni2)
-            rkHSh.Cells("Char.Size").Formula = "8pt"
-            rkHSh.Cells("Char.Style").Formula = "1"
-            rkHSh.Cells("VerticalAlign").Formula = "1"
-            rkHSh.Cells("Para.HorzAlign").Formula = "1"
+        ' 3. Device boxes (rack wrapper + body + header) for every hop
+        For rni = 0 To nRN - 1
+            DrawDeviceBox rn_x(rni), lTop, rn_fsl(rni), rn_lsl(rni), _
+                rn_src(rni), rn_pass(rni), rn_rack(rni), rn_eq(rni)
+        Next rni
 
-            ' Device box (body + header)
-            Dim dvSh As Object
-            Set dvSh = gPage.DrawRectangle(devX, devTopY - devHt, devX + RM_W, devTopY)
-            dvSh.Cells("FillForegnd").Formula = IIf(rn_pass(rni2), C_OF, C_DF)
-            dvSh.Cells("FillBkgnd").Formula = dvSh.Cells("FillForegnd").Formula
-            dvSh.Cells("FillPattern").Formula = "1"
-            dvSh.Cells("LineColor").Formula = C_BDR
-            dvSh.Cells("LineWeight").Formula = "0.75pt"
-            Dim dvHSh As Object
-            Set dvHSh = gPage.DrawRectangle(devX, devTopY - DEV_H, devX + RM_W, devTopY)
-            dvHSh.Cells("FillForegnd").Formula = IIf(rn_pass(rni2), C_OH, C_DH)
-            dvHSh.Cells("FillBkgnd").Formula = dvHSh.Cells("FillForegnd").Formula
-            dvHSh.Cells("FillPattern").Formula = "1"
-            dvHSh.Cells("LineColor").Formula = C_BDR
-            dvHSh.Cells("LineWeight").Formula = "0.5pt"
-            dvHSh.text = rn_eq(rni2)
-            dvHSh.Cells("Char.Size").Formula = "8pt"
-            dvHSh.Cells("Char.Style").Formula = "1"
-            dvHSh.Cells("VerticalAlign").Formula = "1"
-            dvHSh.Cells("Para.HorzAlign").Formula = "1"
-SkipRN:
-        Next rni2
+        ' 4. Source separators (room / rack / device bands on the source box)
+        Dim srcX As Double: srcX = rn_x(srcIdx)
+        Dim gs As Long
+        For gs = 0 To nSlots - 1
+            Dim sp As Integer: sp = sl_sp(gs)
+            If sp = 0 Then GoTo NextSep
+            Dim sepY As Double: sepY = lTop - DEV_H - gs * PORT_H
+            If sp = 3 Then DrawSepLine srcX + 0.05, sepY, srcX + SRC_W - 0.05, C_SRM, "2.5pt"
+            If sp = 2 Then DrawSepLine srcX + 0.05, sepY, srcX + SRC_W - 0.05, C_SR, "1.75pt"
+            If sp = 1 Then DrawSepLine srcX + 0.05, sepY, srcX + SRC_W - 0.05, C_SD, "0.75pt"
+NextSep:
+        Next gs
 
-        ' 3. Source device rack box + device box
-        DrawRackBox lX - SRC_PX, lTop - lH - SRC_PY, _
-                    lX + SRC_W + SRC_PX, lTop + SRC_RKH + SRC_PY, srcNd.Rack
-        ' Source body
-        Dim srcSh As Object
-        Set srcSh = gPage.DrawRectangle(lX, lTop - lH, lX + SRC_W, lTop)
-        srcSh.Cells("FillForegnd").Formula = IIf(srcNd.IsPassive, C_OF, C_DF)
-        srcSh.Cells("FillBkgnd").Formula = srcSh.Cells("FillForegnd").Formula
-        srcSh.Cells("FillPattern").Formula = "1"
-        srcSh.Cells("LineColor").Formula = C_BDR
-        srcSh.Cells("LineWeight").Formula = "0.75pt"
-        ' Source header
-        Dim srcHSh As Object
-        Set srcHSh = gPage.DrawRectangle(lX, lTop - DEV_H, lX + SRC_W, lTop)
-        srcHSh.Cells("FillForegnd").Formula = IIf(srcNd.IsPassive, C_OH, C_DH)
-        srcHSh.Cells("FillBkgnd").Formula = srcHSh.Cells("FillForegnd").Formula
-        srcHSh.Cells("FillPattern").Formula = "1"
-        srcHSh.Cells("LineColor").Formula = C_BDR
-        srcHSh.Cells("LineWeight").Formula = "0.5pt"
-        srcHSh.text = srcNd.Equip
-        srcHSh.Cells("Char.Size").Formula = "9pt"
-        srcHSh.Cells("Char.Style").Formula = "1"
-        srcHSh.Cells("VerticalAlign").Formula = "1"
-        srcHSh.Cells("Para.HorzAlign").Formula = "1"
-
-        ' 4. Source device room banner
-        Dim bnT2 As Double: bnT2 = gPageH - HDRI - HDR_H - SITE_H
-        Dim bnB2 As Double: bnB2 = bnT2 - ROOM_H
-        Dim srcBnSh As Object
-        Set srcBnSh = MkBox(MG, bnB2, MG + srcColW + 0.1, bnT2, 222, 230, 240)
-        srcBnSh.Cells("LineWeight").Formula = "1pt"
-        srcBnSh.text = StrConv(srcNd.Room, vbProperCase)
-        srcBnSh.Cells("Char.Size").Formula = "10pt"
-        srcBnSh.Cells("Char.Style").Formula = "1"
-        srcBnSh.Cells("VerticalAlign").Formula = "1"
-        srcBnSh.Cells("Para.HorzAlign").Formula = "1"
-
-        ' 5. Connection lines, port labels, source separators
-        Dim prevSlot As Long: prevSlot = -1
+        ' 5. Connection lines + port labels
         Dim sg2 As Long
         For sg2 = 0 To nSeg - 1
-            Dim sTyp2 As String: sTyp2 = s_ty(sg2)
-            Dim aK2   As String: aK2 = s_aK(sg2)
-            Dim bK2   As String: bK2 = s_bK(sg2)
-            Dim gsl2  As Long:   gsl2 = s_sl(sg2)
-            If bK2 = "" Then GoTo SkipSg
+            Dim aK2 As String: aK2 = s_aK(sg2)
+            Dim bK2 As String: bK2 = s_bK(sg2)
+            Dim gsl2 As Long:  gsl2 = s_sl(sg2)
+            Dim typ2 As String: typ2 = s_ty(sg2)
+            If bK2 = "" Then GoTo SkipDraw
+            If Not (rnMap.Exists(aK2) And rnMap.Exists(bK2)) Then GoTo SkipDraw
 
+            Dim ai As Long: ai = CLng(rnMap(aK2))
+            Dim bi As Long: bi = CLng(rnMap(bK2))
             Dim lineY As Double: lineY = lTop - DEV_H - (gsl2 + 0.5) * PORT_H
 
-            ' -- Source-side separator and port label ----------------------
-            If aK2 = srcKey Then
-                ' Separator before this slot (only once per slot)
-                If prevSlot <> gsl2 Then
-                    Dim sp2 As Integer: sp2 = sl_sp(gsl2)
-                    Dim sepY As Double: sepY = lTop - DEV_H - gsl2 * PORT_H
-                    If sp2 = 3 Then DrawSepLine lX + 0.05, sepY, lX + SRC_W - 0.05, C_SRM, "2.5pt"
-                    If sp2 = 2 Then DrawSepLine lX + 0.05, sepY, lX + SRC_W - 0.05, C_SR, "1.75pt"
-                    If sp2 = 1 Then DrawSepLine lX + 0.05, sepY, lX + SRC_W - 0.05, C_SD, "0.75pt"
-                    prevSlot = gsl2
-                End If
-                ' Source port label (right-aligned within source box)
-                If sTyp2 <> "NIS" Then
-                    DrawLbl lX, SRC_W, lTop, gsl2, _
-                        s_aP(sg2), s_cl(sg2), sTyp2, s_aC(sg2), s_aT(sg2), True
-                End If
+            ' Outgoing (End-A) port label, right-aligned near the right edge
+            If typ2 <> "NIS" Then
+                Dim aTopY As Double: aTopY = lTop - rn_fsl(ai) * PORT_H
+                DrawLbl rn_x(ai), BoxW(rn_src(ai)), aTopY, gsl2 - rn_fsl(ai), _
+                    s_aP(sg2), s_cl(sg2), typ2, s_aC(sg2), s_aT(sg2), True
+                ' Incoming (End-B) port label, left-aligned near the left edge
+                Dim bTopY As Double: bTopY = lTop - rn_fsl(bi) * PORT_H
+                DrawLbl rn_x(bi), BoxW(rn_src(bi)), bTopY, gsl2 - rn_fsl(bi), _
+                    s_bP(sg2), s_cl(sg2), typ2, s_bC(sg2), s_bT(sg2), False
             End If
 
-            ' -- Continuation End-A port label (LEFT sub-col) --------------
-            If aK2 <> srcKey And sTyp2 <> "NIS" Then
-                Dim aRnK As String: aRnK = aK2 & "|L"
-                If rnMap.Exists(aRnK) Then
-                    Dim aRnI As Long: aRnI = CLng(rnMap(aRnK))
-                    Dim aTopY As Double: aTopY = lTop - rn_fsl(aRnI) * PORT_H
-                    Dim aLocSl As Long:  aLocSl = gsl2 - rn_fsl(aRnI)
-                    Dim aDX As Double: aDX = rs_leftX(rn_sec(aRnI))
-                    DrawLbl aDX, RM_W, aTopY, aLocSl, _
-                        s_aP(sg2), s_cl(sg2), sTyp2, s_aC(sg2), s_aT(sg2), True
-                End If
+            ' Connection line: A right edge -> B left edge (same Y => straight)
+            Dim fromX As Double: fromX = rn_x(ai) + BoxW(rn_src(ai))
+            Dim toX As Double:   toX = rn_x(bi)
+            DrawCktLine fromX, lineY, toX, lineY, typ2
+
+            ' Length label (direct circuits only, mid-span)
+            If aK2 = srcKey And typ2 <> "NIS" And Trim(s_ln(sg2)) <> "" Then
+                Dim lenTxt As String: lenTxt = Trim(s_ln(sg2))
+                If LCase(Right(lenTxt, 1)) <> "m" Then lenTxt = lenTxt & "m"
+                Dim mx As Double: mx = (fromX + toX) / 2
+                TxtBx mx - 0.3, lineY + 0.02, mx + 0.3, lineY + PORT_H * 0.42, lenTxt, 7, 1
             End If
 
-            ' -- Destination port label (RIGHT sub-col) --------------------
-            If sTyp2 <> "NIS" Then
-                Dim dRnK As String: dRnK = bK2 & "|R"
-                If rnMap.Exists(dRnK) Then
-                    Dim dRnI As Long: dRnI = CLng(rnMap(dRnK))
-                    Dim dTopY As Double: dTopY = lTop - rn_fsl(dRnI) * PORT_H
-                    Dim dLocSl As Long:  dLocSl = gsl2 - rn_fsl(dRnI)
-                    Dim dDX As Double: dDX = rs_rightX(rn_sec(dRnI))
-                    DrawLbl dDX, RM_W, dTopY, dLocSl, _
-                        s_bP(sg2), s_cl(sg2), sTyp2, s_bC(sg2), s_bT(sg2), False
-                End If
+            ' NIS label mid-span
+            If typ2 = "NIS" Then
+                Dim mx2 As Double: mx2 = (fromX + toX) / 2
+                TxtBx mx2 - 0.25, lineY + 0.02, mx2 + 0.25, lineY + PORT_H * 0.42, "NIS", 7, 1
             End If
-
-            ' -- Connection line -------------------------------------------
-            ' Compute the exact anchor point (edge + vertical centre of the
-            ' segment's slot row) at BOTH ends, then join them. The line is
-            ' drawn for every segment regardless of left/right ordering so
-            ' multi-room continuation and NIS links are never dropped.
-            Dim fromX As Double, fromY As Double
-            Dim toX As Double,   toY As Double
-            Dim haveFrom As Boolean: haveFrom = False
-            Dim haveTo   As Boolean: haveTo = False
-
-            ' --- End-A anchor (right edge of the End-A device) ---
-            If aK2 = srcKey Then
-                fromX = lX + SRC_W
-                fromY = lineY
-                haveFrom = True
-            Else
-                Dim aRnK2 As String: aRnK2 = aK2 & "|L"
-                If Not rnMap.Exists(aRnK2) Then aRnK2 = aK2 & "|R"
-                If rnMap.Exists(aRnK2) Then
-                    Dim aRnI2 As Long: aRnI2 = CLng(rnMap(aRnK2))
-                    Dim aDevX2 As Double
-                    aDevX2 = IIf(rn_isL(aRnI2), rs_leftX(rn_sec(aRnI2)), rs_rightX(rn_sec(aRnI2)))
-                    fromX = aDevX2 + RM_W
-                    fromY = PortRowY(lTop, rn_fsl(aRnI2), gsl2)
-                    haveFrom = True
-                End If
-            End If
-
-            ' --- End-B anchor (left edge of the End-B device) ---
-            If sTyp2 = "NIS" Then
-                Dim nisBK As String: nisBK = bK2 & "|L"
-                If rnMap.Exists(nisBK) Then
-                    Dim nisBRnI As Long: nisBRnI = CLng(rnMap(nisBK))
-                    toX = rs_leftX(rn_sec(nisBRnI))
-                    toY = PortRowY(lTop, rn_fsl(nisBRnI), gsl2)
-                    haveTo = True
-                End If
-            Else
-                Dim dRnK2 As String: dRnK2 = bK2 & "|R"
-                If rnMap.Exists(dRnK2) Then
-                    Dim dRnI2 As Long: dRnI2 = CLng(rnMap(dRnK2))
-                    toX = rs_rightX(rn_sec(dRnI2))
-                    toY = PortRowY(lTop, rn_fsl(dRnI2), gsl2)
-                    haveTo = True
-                End If
-            End If
-
-            If haveFrom And haveTo Then
-                DrawCktLine fromX, fromY, toX, toY, sTyp2
-
-                ' Length label (direct circuits only, mid-span)
-                If aK2 = srcKey And sTyp2 <> "NIS" And Trim(s_ln(sg2)) <> "" Then
-                    Dim lenTxt As String: lenTxt = Trim(s_ln(sg2))
-                    If LCase(Right(lenTxt, 1)) <> "m" Then lenTxt = lenTxt & "m"
-                    Dim mx As Double: mx = (fromX + toX) / 2
-                    Dim my As Double: my = (fromY + toY) / 2
-                    TxtBx mx - 0.3, my + 0.02, mx + 0.3, my + PORT_H * 0.42, lenTxt, 7, 1
-                End If
-
-                ' NIS label
-                If sTyp2 = "NIS" Then
-                    Dim mx2 As Double: mx2 = (fromX + toX) / 2
-                    Dim my2 As Double: my2 = (fromY + toY) / 2
-                    TxtBx mx2 - 0.25, my2 + 0.02, mx2 + 0.25, my2 + PORT_H * 0.42, "NIS", 7, 1
-                End If
-            End If
-SkipSg:
+SkipDraw:
         Next sg2
 
         ' 6. Page header
@@ -949,22 +783,114 @@ ErrH:
 End Sub
 
 '===========================================================================
-' Vertical centre (Y) of a segment's slot row within a device box.
-' devTopY = Y of top of the source device box (lTop).
-' firstSlot = the device box's first global slot (rn_fsl).
-' globalSlot = the segment's global slot.
+' Ensure a room-node entry exists; ensure its room section exists.
+' Returns the rn index.
 '===========================================================================
-Private Function PortRowY(devTopY As Double, firstSlot As Long, globalSlot As Long) As Double
-    Dim localSlot As Long: localSlot = globalSlot - firstSlot
-    PortRowY = devTopY - firstSlot * PORT_H - DEV_H - (localSlot + 0.5) * PORT_H
+Private Function EnsureRoomNode(k As String, node As clsNode, isSrc As Boolean, _
+    nodesInit As Boolean, _
+    rn_key() As String, rn_rack() As String, rn_eq() As String, _
+    rn_pass() As Boolean, rn_src() As Boolean, rn_sec() As Long, _
+    rn_fsl() As Long, rn_lsl() As Long, rn_hop() As Long, _
+    nRN As Long, rnMap As Object, _
+    rs_room() As String, nRS As Long, rsMap As Object) As Long
+
+    If rnMap.Exists(k) Then EnsureRoomNode = CLng(rnMap(k)): Exit Function
+
+    ' Room section
+    Dim rmKey As String: rmKey = LCase(node.Room)
+    If Not rsMap.Exists(rmKey) Then
+        rsMap.Add rmKey, nRS
+        rs_room(nRS) = node.Room: nRS = nRS + 1
+    End If
+
+    Dim idx As Long: idx = nRN
+    rnMap.Add k, idx
+    rn_key(idx) = k
+    rn_rack(idx) = node.Rack
+    rn_eq(idx) = node.Equip
+    rn_pass(idx) = node.IsPassive
+    rn_src(idx) = isSrc
+    rn_sec(idx) = CLng(rsMap(rmKey))
+    rn_fsl(idx) = 999999
+    rn_lsl(idx) = -1
+    rn_hop(idx) = -1
+    nRN = nRN + 1
+    EnsureRoomNode = idx
+End Function
+
+Private Sub UpdateSlot(idx As Long, gsl As Long, rn_fsl() As Long, rn_lsl() As Long)
+    If gsl < rn_fsl(idx) Then rn_fsl(idx) = gsl
+    If gsl > rn_lsl(idx) Then rn_lsl(idx) = gsl
+End Sub
+
+Private Function BoxW(isSrc As Boolean) As Double
+    BoxW = IIf(isSrc, SRC_W, RM_W)
 End Function
 
 '===========================================================================
+' DRAW - ONE DEVICE (rack wrapper + body + header)
+'===========================================================================
+Private Sub DrawDeviceBox(devX As Double, lTop As Double, fsl As Long, lsl As Long, _
+    isSrc As Boolean, isPass As Boolean, rackTxt As String, eqTxt As String)
+    If lsl < fsl Then Exit Sub
+    Dim bw As Double: bw = BoxW(isSrc)
+    Dim px As Double: px = IIf(isSrc, SRC_PX, RM_PX)
+    Dim py As Double: py = IIf(isSrc, SRC_PY, RM_PY)
+    Dim rkh As Double: rkh = IIf(isSrc, SRC_RKH, RM_RKH)
+    Dim fpt As String: fpt = IIf(isSrc, "9pt", "8pt")
+
+    Dim devTopY As Double: devTopY = lTop - fsl * PORT_H
+    Dim devHt As Double: devHt = DEV_H + (lsl - fsl + 1) * PORT_H
+
+    ' Rack box
+    Dim rkX1 As Double: rkX1 = devX - px
+    Dim rkX2 As Double: rkX2 = devX + bw + px
+    Dim rkY1 As Double: rkY1 = devTopY - devHt - py
+    Dim rkY2 As Double: rkY2 = devTopY + rkh + py
+    Dim rkSh As Object: Set rkSh = gPage.DrawRectangle(rkX1, rkY1, rkX2, rkY2)
+    rkSh.Cells("FillForegnd").Formula = C_RKB
+    rkSh.Cells("FillBkgnd").Formula = C_RKB
+    rkSh.Cells("FillPattern").Formula = "1"
+    rkSh.Cells("LineColor").Formula = C_BRK
+    rkSh.Cells("LineWeight").Formula = IIf(isSrc, "1pt", "0.75pt")
+    Dim rkHSh As Object: Set rkHSh = gPage.DrawRectangle(rkX1, rkY2 - rkh, rkX2, rkY2)
+    rkHSh.Cells("FillForegnd").Formula = C_RKH
+    rkHSh.Cells("FillBkgnd").Formula = C_RKH
+    rkHSh.Cells("FillPattern").Formula = "1"
+    rkHSh.Cells("LineColor").Formula = C_BRK
+    rkHSh.Cells("LineWeight").Formula = "0.5pt"
+    rkHSh.text = rackTxt
+    rkHSh.Cells("Char.Size").Formula = fpt
+    rkHSh.Cells("Char.Style").Formula = "1"
+    rkHSh.Cells("VerticalAlign").Formula = "1"
+    rkHSh.Cells("Para.HorzAlign").Formula = "1"
+
+    ' Device body
+    Dim dvSh As Object: Set dvSh = gPage.DrawRectangle(devX, devTopY - devHt, devX + bw, devTopY)
+    dvSh.Cells("FillForegnd").Formula = IIf(isPass, C_OF, C_DF)
+    dvSh.Cells("FillBkgnd").Formula = dvSh.Cells("FillForegnd").Formula
+    dvSh.Cells("FillPattern").Formula = "1"
+    dvSh.Cells("LineColor").Formula = C_BDR
+    dvSh.Cells("LineWeight").Formula = "0.75pt"
+    ' Device header
+    Dim dvHSh As Object: Set dvHSh = gPage.DrawRectangle(devX, devTopY - DEV_H, devX + bw, devTopY)
+    dvHSh.Cells("FillForegnd").Formula = IIf(isPass, C_OH, C_DH)
+    dvHSh.Cells("FillBkgnd").Formula = dvHSh.Cells("FillForegnd").Formula
+    dvHSh.Cells("FillPattern").Formula = "1"
+    dvHSh.Cells("LineColor").Formula = C_BDR
+    dvHSh.Cells("LineWeight").Formula = "0.5pt"
+    dvHSh.text = eqTxt
+    dvHSh.Cells("Char.Size").Formula = fpt
+    dvHSh.Cells("Char.Style").Formula = "1"
+    dvHSh.Cells("VerticalAlign").Formula = "1"
+    dvHSh.Cells("Para.HorzAlign").Formula = "1"
+End Sub
+
+'===========================================================================
 ' DRAW - PORT LABEL
-' devTopY = Y of top of device box (= lTop for source, lTop-fsl*PORT_H for room nodes)
-' localSlot = slot index relative to this device (0-based)
-' rightAligned: True = text right-aligned (source / LEFT sub-col devices)
-'               False = text left-aligned  (RIGHT sub-col devices)
+' devTopY = Y of top of the device box; localSlot = row index within the box.
+' rightAligned: True = text hugs right edge (outgoing / End-A)
+'               False = text hugs left edge (incoming / End-B)
 '===========================================================================
 Private Sub DrawLbl(devX As Double, devWd As Double, devTopY As Double, _
     localSlot As Long, portTxt As String, calTxt As String, cabTyp As String, _
@@ -991,10 +917,8 @@ End Sub
 
 '===========================================================================
 ' DRAW - CONNECTION LINES
-' Joins (x1,y1) to (x2,y2). When the two anchors share a height the link is a
-' single horizontal line; otherwise it is routed orthogonally (L-shaped) via
-' a mid-span vertical so the link always lands on both device edges instead
-' of leaving a stray diagonal.
+' Joins (x1,y1) to (x2,y2). Same height => single horizontal line; otherwise
+' routed orthogonally (L-shaped) via a mid-span vertical.
 '===========================================================================
 Private Sub DrawCktLine(x1 As Double, y1 As Double, x2 As Double, y2 As Double, cabTyp As String)
     If Abs(x2 - x1) < 0.0001 And Abs(y2 - y1) < 0.0001 Then Exit Sub
@@ -1036,32 +960,6 @@ Private Sub DrawSepLine(x1 As Double, y As Double, x2 As Double, _
     sh.Cells("LineWeight").Formula = wt
     sh.Cells("BeginArrow").Formula = "0"
     sh.Cells("EndArrow").Formula = "0"
-End Sub
-
-'===========================================================================
-' DRAW - SOURCE RACK BOX
-'===========================================================================
-Private Sub DrawRackBox(x1 As Double, y1 As Double, x2 As Double, y2 As Double, rk As String)
-    Dim sh As Object
-    Set sh = gPage.DrawRectangle(x1, y1, x2, y2)
-    sh.Cells("FillForegnd").Formula = C_RKB
-    sh.Cells("FillBkgnd").Formula = C_RKB
-    sh.Cells("FillPattern").Formula = "1"
-    sh.Cells("LineColor").Formula = C_BRK
-    sh.Cells("LineWeight").Formula = "1pt"
-    Dim hdrY As Double: hdrY = y2 - SRC_RKH
-    Dim hSh As Object
-    Set hSh = gPage.DrawRectangle(x1, hdrY, x2, y2)
-    hSh.Cells("FillForegnd").Formula = C_RKH
-    hSh.Cells("FillBkgnd").Formula = C_RKH
-    hSh.Cells("FillPattern").Formula = "1"
-    hSh.Cells("LineColor").Formula = C_BRK
-    hSh.Cells("LineWeight").Formula = "0.5pt"
-    hSh.text = rk
-    hSh.Cells("Char.Size").Formula = "9pt"
-    hSh.Cells("Char.Style").Formula = "1"
-    hSh.Cells("VerticalAlign").Formula = "1"
-    hSh.Cells("Para.HorzAlign").Formula = "1"
 End Sub
 
 '===========================================================================
