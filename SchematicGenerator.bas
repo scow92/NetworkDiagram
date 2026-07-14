@@ -585,16 +585,16 @@ SkipSeg:
         For rs = 0 To nRS - 1: rs_rank(ord(rs)) = rs: Next rs
 
         ' Room band boundaries (midpoints between adjacent rooms, tiled edge-to-edge)
-        Dim bnd(MAXRS) As Double
-        bnd(0) = MG
-        bnd(nRS) = gPageW - MG
+        Dim zbnd(MAXRS) As Double
+        zbnd(0) = MG
+        zbnd(nRS) = gPageW - MG
         Dim bb As Long
         For bb = 1 To nRS - 1
             Dim lRoom As Long: lRoom = ord(bb - 1)
             Dim rRoom As Long: rRoom = ord(bb)
             Dim lEdge As Double: lEdge = colX(rs_maxHop(lRoom)) + BoxWAtHop(rs_maxHop(lRoom))
             Dim rEdge As Double: rEdge = colX(rs_minHop(rRoom))
-            bnd(bb) = (lEdge + rEdge) / 2
+            zbnd(bb) = (lEdge + rEdge) / 2
         Next bb
 
         '===================================================================
@@ -633,8 +633,8 @@ SkipSeg:
         ' 1. Room zones: swim-lane background + header band (tiled edge-to-edge)
         For rs = 0 To nRS - 1
             Dim ra As Long: ra = rs_rank(rs)
-            Dim zL As Double: zL = bnd(ra)
-            Dim zR As Double: zR = bnd(ra + 1)
+            Dim zL As Double: zL = zbnd(ra)
+            Dim zR As Double: zR = zbnd(ra + 1)
 
             ' vertical extent of this room's devices
             Dim fsInSec As Long: fsInSec = 999999
@@ -673,7 +673,7 @@ NextZone:
         Dim contBot As Double: contBot = lTop - nSlots * PORT_H - DEV_H - SRC_PY
         Dim dv As Long
         For dv = 1 To nRS - 1
-            Dim dvX As Double: dvX = bnd(dv)
+            Dim dvX As Double: dvX = zbnd(dv)
             Dim dvSh0 As Object: Set dvSh0 = gPage.DrawLine(dvX, contBot, dvX, contTop)
             dvSh0.Cells("LineColor").Formula = C_DIV
             dvSh0.Cells("LinePattern").Formula = "2"
