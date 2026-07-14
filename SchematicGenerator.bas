@@ -109,6 +109,12 @@ Private Const N_COL As String = "THEMEGUARD(RGB(0,80,200))"
 Private Const N_PAT As String = "4"
 Private Const N_WT  As String = "1pt"
 
+'-- DEBUG ------------------------------------------------------------------
+' Set DBG = True, run CreateSchematic, then open the Immediate window
+' (Ctrl+G in the VBE) to see the computed hop / X / slot for every device and
+' segment. Paste that back to diagnose layout problems.
+Private Const DBG As Boolean = False
+
 '-- MODULE STATE -----------------------------------------------------------
 Private gApp   As Object
 Private gPage  As Object
@@ -512,9 +518,13 @@ Public Sub CreateSchematic()
 
             ' Hop distance: B is one hop past A. Use the LONGEST path so each
             ' device settles at its deepest column and links never run backwards.
+            ' The source is always column 0 and must NEVER be pushed right, even
+            ' if a CAL chain loops an End-B back onto it.
             If rn_hop(aIdx) < 0 Then rn_hop(aIdx) = 0
             Dim h As Long: h = rn_hop(aIdx) + 1
-            If h > rn_hop(bIdx) Then rn_hop(bIdx) = h
+            If bIdx <> srcIdx Then
+                If h > rn_hop(bIdx) Then rn_hop(bIdx) = h
+            End If
 
             UpdateSlot aIdx, gsl, rn_fsl, rn_lsl
             UpdateSlot bIdx, gsl, rn_fsl, rn_lsl
@@ -522,7 +532,8 @@ SkipSeg:
         Next sg
         If nRN = 0 Then GoTo NextSrc
 
-        ' Any device never reached keeps hop 0 (normally only the source)
+        ' Pin the source at hop 0; any device never reached also keeps hop 0
+        rn_hop(srcIdx) = 0
         Dim rni As Long
         For rni = 0 To nRN - 1
             If rn_hop(rni) < 0 Then rn_hop(rni) = 0
@@ -561,6 +572,17 @@ SkipSeg:
         For rni = 0 To nRN - 1
             rn_x(rni) = colX(rn_hop(rni))
         Next rni
+
+        If DBG Then
+            Debug.Print "===== PAGE src=" & srcNd.Equip & "  nRN=" & nRN & _
+                "  maxHop=" & maxHop & "  nSlots=" & nSlots & "  pageW=" & Format(gPageW, "0.0")
+            Debug.Print "DEVICES: idx  hop  x      fsl  lsl  room | equip"
+            For rni = 0 To nRN - 1
+                Debug.Print "  " & rni & "  h" & rn_hop(rni) & "  x=" & _
+                    Format(rn_x(rni), "0.00") & "  " & rn_fsl(rni) & ".." & rn_lsl(rni) & _
+                    "  " & rs_room(rn_sec(rni)) & " | " & rn_eq(rni) & IIf(rn_src(rni), "  <SRC>", "")
+            Next rni
+        End If
 
         ' Per-room hop-column range (drives the room bands + dividers)
         Dim rs As Long
@@ -730,6 +752,12 @@ NextSep:
             Dim fromX As Double: fromX = rn_x(ai) + BoxW(rn_src(ai))
             Dim toX As Double:   toX = rn_x(bi)
             DrawCktLine fromX, lineY, toX, lineY, typ2
+
+            If DBG Then
+                Debug.Print "SEG slot" & gsl2 & " " & typ2 & _
+                    "  fromX=" & Format(fromX, "0.00") & " toX=" & Format(toX, "0.00") & _
+                    " y=" & Format(lineY, "0.00") & "  [" & rn_eq(ai) & " -> " & rn_eq(bi) & "]"
+            End If
 
             ' Length label (direct circuits only, mid-span)
             If aK2 = srcKey And typ2 <> "NIS" And Trim(s_ln(sg2)) <> "" Then
